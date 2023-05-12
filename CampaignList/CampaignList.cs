@@ -1,29 +1,46 @@
-using Azure.Messaging.ServiceBus;
+using CampaignModels;
 using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.PowerPlatform.Dataverse.Client;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Messages;
 using Microsoft.Xrm.Sdk.Query;
-using Newtonsoft.Json;
+//using Newtonsoft.Json;
+//using Newtonsoft.Json.Linq;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection.Metadata;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
+using static CampaignModels.CampaignManager;
 
 namespace CampaignList
 {
+    [StorageAccount("AzureWebJobsStorage")]
     public static class CampaignList
     {
+        // Dataverse client
         private static ServiceClient dataverseClient = null;
-        private static HashSet<string> alreadySentEmails = new();
+
+        // Retrieved campaign contacts
+        private static HashSet<string> retrievedEmails;
+
+        // Retrieved campaign contacts
+        private static HashSet<string> duplicateEmails;
+
+        // Retrieved campaign contacts
+        private static HashSet<string> queuedEmails;
+
+        // Retrieved campaign contacts
+        private static HashSet<string> unsentEmails;
 
 
         /// <summary>
@@ -35,52 +52,95 @@ namespace CampaignList
         /// <returns>The URLs to check the status of the function.</returns>
         [FunctionName("CampaignListHttpStart")]
         public static async Task<HttpResponseMessage> HttpStart(
-           [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", Route = "campaign")] HttpRequestMessage req,
-           [DurableClient] IDurableOrchestrationClient client,
+           [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "campaign")] HttpRequestMessage req,
+           [Blob("campaign-mailer/campaign-mailer-config.json", FileAccess.Write)] Stream configStream,
+           [Blob("campaign-mailer/campaign-metrics.json", FileAccess.Read)] string inMetricsStr,
+           [Blob("campaign-mailer/campaign-metrics.json", FileAccess.Write)] Stream outMetricsStream,
+           [Queue("%QueueName%")] ICollector<Contact> queueContacts,
            ILogger log)
         {
-            // Get the campaign information from the HTTP request body
+            // Initialize member collections
+            retrievedEmails = new HashSet<string>();
+            queuedEmails = new HashSet<string>();
+            duplicateEmails = new HashSet<string>();
+            unsentEmails = new HashSet<string>();
+            
+            // Get start date/time
+            DateTime runStart = DateTime.Now;
+
+            // Get campaign information from the HTTP request body and save to blob storage
             CampaignConfiguration campaignConfig = await req.Content.ReadAsAsync<CampaignConfiguration>();
+            string ccStr = JsonSerializer.Serialize(campaignConfig);
+            byte[] ccBytes = Encoding.UTF8.GetBytes(ccStr);
+            await configStream.WriteAsync(ccBytes, 0, ccBytes.Length);
+            configStream.Flush();
 
-            // Function input comes from the request content.
-            string instanceId = await client.StartNewAsync("CampaignListOrchestrator", campaignConfig);
-
-            log.LogInformation($"Started orchestration with ID = '{instanceId}", instanceId);
-
-            // Create the URL to allow the client to check status of a request (excluding the function key in the code querystring)
-            string checkStatusUrl = string.Format("{0}://{1}:{2}/campaign/CampaignListHttpStart_Status?id={3}", req.RequestUri.Scheme, req.RequestUri.Host, req.RequestUri.Port, instanceId);
-
-            // Create the response and add headers
-            var response = new HttpResponseMessage()
+            // Fetch the contact list from Dataverse and queue the contacts
+            ContactList contactList = new ContactList(campaignConfig.ListName, campaignConfig.PageSize);
+            while (contactList.IsMoreContacts)
             {
-                StatusCode = System.Net.HttpStatusCode.Accepted,
-                Content = new StringContent(checkStatusUrl),
-            };
-            response.Headers.Add("Location", checkStatusUrl);
-            response.Headers.Add("Retry-After", "10");
+                CreateContactList(contactList, queueContacts, log);
+            }
 
-            return response;
+            // Get end date/time
+            DateTime runEnd = DateTime.Now;
+
+            // Write the campaign metrics to blob storage
+            CampaignMetrics campaignMetrics = new(contactList.ListName, runStart, runEnd, retrievedEmails.Count, queuedEmails.Count, duplicateEmails.Count, unsentEmails.Count);
+            FormatMetrics(campaignMetrics, inMetricsStr, outMetricsStream, log);
+
+            // Return HTTP response
+            return req.CreateResponse(System.Net.HttpStatusCode.Accepted);
+        }
+
+
+        public static void FormatMetrics(CampaignMetrics currMetrics, string prevMetrics, Stream outStream, ILogger log)
+        {
+            // Create the primary instance used to store metrics
+            CampaignManager cm = new();
+
+            // Format the metrics for the current run
+            if (currMetrics != null)
+            {
+                // Format the current metrics
+                cm.campaignMetrics.Add(currMetrics);
+            }
+            else
+            {
+                log.LogError($"************** FormatMetrics: Error: Current metrics were not available **************");
+            }
+
+            // Add the metrics from the previous runs
+            if (prevMetrics != null) 
+            {
+                CampaignManager prevManager = JsonSerializer.Deserialize<CampaignManager>(prevMetrics);
+                foreach (CampaignMetrics metricsRun in prevManager.campaignMetrics)
+                {
+                    cm.campaignMetrics.Add(metricsRun);
+                }
+            }
+
+            log.LogInformation($"************** FormatMetrics: Storing metrics run history **************");
+
+            JsonSerializerOptions options = new() { WriteIndented = true };
+            string metricsStr = JsonSerializer.Serialize(cm, options);
+            byte[] metricsBytes = Encoding.UTF8.GetBytes(metricsStr);
+            outStream.Write(metricsBytes);
+            outStream.Flush();
         }
 
 
         /// <summary>
-        /// Orchestrates all activity functions for the campaign list queuing process.
+        /// Fetches contacts from the Dataverse campaign list and build a contact list.
         /// </summary>
         /// <param name="context">The context object of the orchestration.</param>
         /// <param name="log">The logger instance used to log messages and status.</param>
         /// <returns></returns>
-        [FunctionName("CampaignListOrchestrator")]
-        public static async Task<string> RunOrchestrator(
-            [OrchestrationTrigger] IDurableOrchestrationContext context,
-            [ServiceBus("myqueue", Connection = "ServiceBusConn")] IAsyncCollector<string> queueContacts,
+        public static void CreateContactList(ContactList contactList,
+            [Queue("q-sa-campaign-mailer")] ICollector<Contact> queueContacts,
             ILogger log)
         {
-            log.LogInformation($"************** RunOrchestrator method executing ********************");
-
-            // Retrive the campaign configuration object from the HTTP context
-            CampaignConfiguration campaignConfig = context.GetInput<CampaignConfiguration>();
-
-            alreadySentEmails = GetAlreadyMailedAddresses();
+            log.LogInformation($"************** CreateContactList: Method Executing ********************");
 
             // Create the Dataverse ServiceClient by connecting to the Dataverse database
             if (dataverseClient == null)
@@ -88,53 +148,37 @@ namespace CampaignList
                 InitializeDataverseClient(log);
             }
 
-            // Fan out the Dataverse query and queuing to run in parallel
-            log.LogInformation($"************** Fanning out ********************");
-
             // Process the campaign list
-            if (campaignConfig.ListName.Length > 0)
+            if (contactList.ListName.Length > 0)
             {
                 if (dataverseClient.IsReady)
                 {
-                    // Define the query attributes for pagination of the results.
-                    // Set the number of records per page to retrieve.
-                    int pageSize = campaignConfig.PageSize;
-
                     // Initialize the page number.
-                    int pageNumber = 1;
-
-                    // Specify the current paging cookie. For retrieving the first page, 
-                    // pagingCookie should be null.
-                    string pagingCookie = null;
-
+                    contactList.AddPage();
 
                     // Determine if the list is dynamic or static
-                    bool isDynamic = IsDynamic(campaignConfig.ListName);
+                    contactList.IsDynamic = IsDynamic(contactList.ListName);
 
-                    // Get the query XML specific to dynamic and static lists
-                    string queryXml;
-                    if (isDynamic)
+                    // Get the query XML specific to dynamic or static lists
+                    if (contactList.IsDynamic)
                     {
                         // Get the XML query
-                        queryXml = GetDynamicQuery(campaignConfig.ListName);
+                        contactList.QueryXml = GetDynamicQuery(contactList.ListName);
                     }
                     else
                     {
                         // Retrieve the ID of the static campaign list
-                        var listId = GetCampaignListID(campaignConfig.ListName);
-                        queryXml = GetStaticQuery(listId);
+                        var listId = GetCampaignListID(contactList.ListName);
+                        contactList.QueryXml = GetStaticQuery(listId);
                     }
 
-                    int contactCount = 0;
-
                     // Process each page of the list query results until every page has been processed
-                    bool morePages = true;
                     try
                     {
-                        while (morePages)
+                        while (contactList.IsMoreContacts)
                         {
                             // Add the pagination attributes to the XML query.
-                            string currQueryXml = AddPaginationAttributes(queryXml, pagingCookie, pageNumber, pageSize);
+                            string currQueryXml = AddPaginationAttributes(contactList);
 
                             // Excute the fetch query and get the results in XML format.
                             RetrieveMultipleRequest fetchRequest = new()
@@ -142,157 +186,84 @@ namespace CampaignList
                                 Query = new FetchExpression(currQueryXml)
                             };
 
-                            log.LogInformation($"************** Fetching page {pageNumber} ********************");
+                            
+                            log.LogInformation($"************** CreateContactList: Fetching Page {contactList.PageNumber} ********************");
 
                             EntityCollection pageCollection = ((RetrieveMultipleResponse)dataverseClient.Execute(fetchRequest)).EntityCollection;
 
                             // Convert EntityCollection to JSON serializable object collection.
-                            List<CampaignContact> pageContactList = new();
                             if (pageCollection.Entities.Count > 0)
                             {
-                                foreach (var contact in pageCollection.Entities)
+                                foreach (var pageContact in pageCollection.Entities)
                                 {
-                                    CampaignContact campaignContact = new();
-                                    if (isDynamic)
+                                    Contact campaignContact = new();
+                                    if (contactList.IsDynamic)
                                     {
-                                        campaignContact.EmailAddress = contact.Attributes["emailaddress1"].ToString();
-                                        campaignContact.FullName = contact.Attributes["fullname"].ToString();
+                                        campaignContact.EmailAddress = pageContact.Attributes["emailaddress1"].ToString();
+                                        campaignContact.FullName = pageContact.Attributes["fullname"].ToString();
                                     }
                                     else
                                     {
-                                        campaignContact.EmailAddress = ((AliasedValue)contact.Attributes["Contact.emailaddress1"]).Value.ToString();
-                                        campaignContact.FullName = ((AliasedValue)contact.Attributes["Contact.fullname"]).Value.ToString();
+                                        campaignContact.EmailAddress = ((AliasedValue)pageContact.Attributes["Contact.emailaddress1"]).Value.ToString();
+                                        campaignContact.FullName = ((AliasedValue)pageContact.Attributes["Contact.fullname"]).Value.ToString();
                                     }
-                                    campaignContact.MessageSubject = campaignConfig.MessageSubject;
-                                    campaignContact.MessageBodyHtml = campaignConfig.MessageBodyHtml;
-                                    campaignContact.MessageBodyPlainText = campaignConfig.MessageBodyPlainText;
-                                    campaignContact.SenderEmailAddress = campaignConfig.SenderEmailAddress;
-                                    campaignContact.ReplyToEmailAddress = campaignConfig.ReplyToEmailAddress;
-                                    campaignContact.ReplyToDisplayName = campaignConfig.ReplyToDisplayName;
 
-                                    // Add contact to contact list
-                                    pageContactList.Add(campaignContact);
+                                    // Add email to the contact list
+                                    if (!retrievedEmails.Contains(campaignContact.EmailAddress))
+                                    {
+                                        // Add contact to contact list
+                                        contactList.AddContact(campaignContact);
+                                        retrievedEmails.Add(campaignContact.EmailAddress);
+
+                                        // Add contact to stroage queue
+                                        queueContacts.Add(campaignContact);
+                                        queuedEmails.Add(campaignContact.EmailAddress);
+                                    }
+                                    else
+                                    {
+                                        duplicateEmails.Add(campaignContact.EmailAddress);
+                                    }
                                 }
-                            }
-
-                            contactCount += pageContactList.Count;
-
-                            // Start the new activity function and capture the task reference.
-                            try
-                            {
-                                await QueueContacts(pageContactList, queueContacts, log);
-                            }
-                            catch (Exception ex)
-                            {
-                                log.LogError($"{ex}");
+                                log.LogInformation($"************** CreateContactList: Successfully Queued Contacts: {queuedEmails.Count} **************");
                             }
 
                             // Check for more records.
                             if (pageCollection.MoreRecords)
                             {
                                 // Increment the page number to retrieve the next page.
-                                pageNumber++;
+                                contactList.AddPage();
 
                                 // Set the paging cookie to the paging cookie returned from current results.                            
-                                pagingCookie = pageCollection.PagingCookie;
+                                contactList.PagingCookie = pageCollection.PagingCookie;
                             }
                             else
                             {
-                                morePages = false;
+                                // Set the more records flag to false to end the loop
+                                contactList.IsMoreContacts = false;
                             }
                         }
                     }
                     catch (Exception ex)
                     {
-                        log.LogError($"{ex}");
-
+                        log.LogError($"************** CreateContactList: Error creating contact list {ex} **************");
                     }
 
-                    log.LogInformation($"Total number of contacts in the list: {contactCount}");
-                    log.LogInformation($"Successfully completed processing {campaignConfig.ListName}");
+                    log.LogInformation($"************** CreateContactList: Successfully completed processing Campaign: {contactList.ListName} **************");
+                    log.LogInformation($"************** CreateContactList: Total number of contacts: {contactList.ContactCount} **************");
                 }
                 else
                 {
-                    log.LogInformation($"A web service connection was not established. Campaign list {campaignConfig.ListName} was not processed");
+                    log.LogInformation($"Dataverse connection was not established. Campaign list {contactList.ListName} was not processed");
                 }
             }
             else
             {
+                contactList.IsMoreContacts = false;
                 log.LogInformation("Campaign list name was empty. Please provide the name of a campaign list to process.");
             }
-
-            // Wait until all the activity functions have done their work
-            log.LogInformation($"************** 'Waiting' for parallel results ********************");
-            log.LogInformation($"************** All activity functions complete ********************");
-
-            return "Finished";
+            //return Task.FromResult(contactList);
         }
-
-
-        [FunctionName("QueryContactsActivity")]
-        public static List<CampaignContact> QueryContacts(
-            [ActivityTrigger] List<CampaignContact> contactList, ILogger log)
-        {
-
-            return contactList;
-        }
-
-
-        /// <summary>
-        /// Queues campaign email list contacts in the Azure Storage queue.
-        /// </summary>
-        /// <param name="pageCollection">EntityCollection containing the list of CampaignContact objects</param>
-        /// <param name="log">Logger object used to log messages to Log Analytics workspace</param>
-        /// <returns></returns>
-        //[FunctionName("QueueContactsActivity")]
-        public static async Task QueueContacts(
-            List<CampaignContact> contactList,
-            IAsyncCollector<string> queueContacts,
-            ILogger log)
-        {
-            // Iterate through EntityCollection and queue each campaign contact
-            foreach (CampaignContact campaignContact in contactList)
-            {
-                if (IsAlreadyMailed(campaignContact.EmailAddress))
-                {
-                    continue;
-                }
-
-                // Convert campaign contact to JSON and add it to the Azure Storage queue
-                string ccJson = JsonConvert.SerializeObject(campaignContact);
-                try
-                {
-                    _ = queueContacts.AddAsync(ccJson);
-                }
-                catch (ServiceBusException sbex)
-                {
-                    log.LogError($"ServiceBusException: {sbex.Message}");
-
-                    try
-                    {
-                        if (sbex.Reason == ServiceBusFailureReason.QuotaExceeded)
-                        {
-                            // Service Bus Queue Quota exceeded. Wait 5 minutes and try again.
-                            await Task.Delay(300000);
-                            await queueContacts.AddAsync(ccJson);
-                        }
-                        else if (sbex.Reason == ServiceBusFailureReason.ServiceBusy)
-                        {
-                            // Temporary error. Wait 10 seconds and try again.
-                            await Task.Delay(10000);
-                            await queueContacts.AddAsync(ccJson);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        log.LogError($"{ex}");
-                    }
-                }
-            }
-
-            log.LogInformation($"Added {contactList.Count} to ServiceBus Queue.");
-        }
-
+     
 
         /// <summary>
         /// Create XML query that allows for paginated retrieval of campaign contacts.
@@ -364,9 +335,9 @@ namespace CampaignList
         /// <param name="pageNum">The page number of the previous page</param>
         /// <param name="pageSize">The number of records in each page</param>
         /// <returns></returns>
-        public static string AddPaginationAttributes(string queryXml, string pageCookie, int pageNum, int pageSize)
+        public static string AddPaginationAttributes(ContactList contactList)
         {
-            StringReader stringReader = new StringReader(queryXml);
+            StringReader stringReader = new StringReader(contactList.QueryXml);
             XmlReader reader = XmlReader.Create(stringReader);          //new XmlTextReader(stringReader);
 
             // Load document
@@ -375,19 +346,19 @@ namespace CampaignList
 
             XmlAttributeCollection attrs = doc.DocumentElement.Attributes;
 
-            if (pageCookie != null)
+            if (contactList.PagingCookie != null)
             {
                 XmlAttribute pagingAttr = doc.CreateAttribute("paging-cookie");
-                pagingAttr.Value = pageCookie;
+                pagingAttr.Value = contactList.PagingCookie;
                 attrs.Append(pagingAttr);
             }
 
             XmlAttribute pageAttr = doc.CreateAttribute("page");
-            pageAttr.Value = System.Convert.ToString(pageNum);
+            pageAttr.Value = System.Convert.ToString(contactList.PageNumber);
             attrs.Append(pageAttr);
 
             XmlAttribute countAttr = doc.CreateAttribute("count");
-            countAttr.Value = System.Convert.ToString(pageSize);
+            countAttr.Value = System.Convert.ToString(contactList.PageSize);
             attrs.Append(countAttr);
 
             StringBuilder sb = new StringBuilder(1024);
@@ -470,24 +441,8 @@ namespace CampaignList
         /// <returns>Returns a ServiceClient used to access and query the database.</returns>
         private static void InitializeDataverseClient(ILogger log)
         {
-            // Dataverse environment URL and auth credentials.
             // Dataverse environment URL and login info.
-            string url = Environment.GetEnvironmentVariable("DATAVERSE_URL");
-            string appId = Environment.GetEnvironmentVariable("DATAVERSE_APPID");
-            string secret = Environment.GetEnvironmentVariable("DATAVERSE_SECRET");
-
-
-
-            // Create the Dataverse connection string
-            string connectionString =
-                $@"AuthType=ClientSecret;
-                SkipDiscovery=true;url={url};
-                Secret={secret};
-                ClientId={appId};
-                RequireNewInstance=true";
-
-            //string connectionString = Environment.GetEnvironmentVariable("DataverseConn");
-
+            string connectionString = Environment.GetEnvironmentVariable("DataverseConn");
             try
             {
                 // Create the Dataverse ServiceClient instance
@@ -498,26 +453,6 @@ namespace CampaignList
             {
                 log.LogInformation($"Exception thrown creating the Dataverse ServiceClient: {ex.Message}");
             }
-        }
-
-        private static HashSet<string> GetAlreadyMailedAddresses()
-        {
-            HashSet<string> addresses = new();
-            string path = Path.Combine(Environment.CurrentDirectory, "AlreadyMailedAddresses.txt");
-            using (StreamReader sr = new StreamReader(path))
-            {
-                string line;
-                while ((line = sr.ReadLine()) != null)
-                {
-                    addresses.Add(line);
-                }
-            }
-            return addresses;
-        }
-
-        private static bool IsAlreadyMailed(string emailAddress)
-        {
-            return alreadySentEmails.Contains(emailAddress);
         }
     }
 }

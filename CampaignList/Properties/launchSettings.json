@@ -2,7 +2,7 @@
   "profiles": {
     "CampaignList": {
       "commandName": "Project",
-      "commandLineArgs": "--port 7114",
+      "commandLineArgs": "--port 7002",
       "launchBrowser": false
     }
   }
